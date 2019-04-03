@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/services/web/mgmt/2018-02-01/web"
@@ -197,6 +198,24 @@ func resourceArmFunctionApp() *schema.Resource {
 							Type:     schema.TypeString,
 							Optional: true,
 							Computed: true,
+						},
+						"ip_restriction": {
+							Type:     schema.TypeList,
+							Optional: true,
+							Computed: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"ip_address": {
+										Type:     schema.TypeString,
+										Required: true,
+									},
+									"subnet_mask": {
+										Type:     schema.TypeString,
+										Optional: true,
+										Default:  "255.255.255.255",
+									},
+								},
+							},
 						},
 					},
 				},
@@ -644,6 +663,33 @@ func expandFunctionAppSiteConfig(d *schema.ResourceData) web.SiteConfig {
 		siteConfig.LinuxFxVersion = utils.String(v.(string))
 	}
 
+	if v, ok := config["ip_restriction"]; ok {
+		ipSecurityRestrictions := v.([]interface{})
+		restrictions := make([]web.IPSecurityRestriction, 0)
+		for _, ipSecurityRestriction := range ipSecurityRestrictions {
+			restriction := ipSecurityRestriction.(map[string]interface{})
+
+			ipAddress := restriction["ip_address"].(string)
+			mask := restriction["subnet_mask"].(string)
+			// the 2018-02-01 API expects a blank subnet mask and an IP address in CIDR format: a.b.c.d/x
+			// so translate the IP and mask if necessary
+			restrictionMask := ""
+			cidrAddress := ipAddress
+			if mask != "" {
+				ipNet := net.IPNet{IP: net.ParseIP(ipAddress), Mask: net.IPMask(net.ParseIP(mask))}
+				cidrAddress = ipNet.String()
+			} else if !strings.Contains(ipAddress, "/") {
+				cidrAddress += "/32"
+			}
+
+			restrictions = append(restrictions, web.IPSecurityRestriction{
+				IPAddress:  &cidrAddress,
+				SubnetMask: &restrictionMask,
+			})
+		}
+		siteConfig.IPSecurityRestrictions = &restrictions
+	}
+
 	return siteConfig
 }
 
@@ -671,6 +717,29 @@ func flattenFunctionAppSiteConfig(input *web.SiteConfig) []interface{} {
 	if input.LinuxFxVersion != nil {
 		result["linux_fx_version"] = *input.LinuxFxVersion
 	}
+
+	restrictions := make([]interface{}, 0)
+	if vs := input.IPSecurityRestrictions; vs != nil {
+		for _, v := range *vs {
+			block := make(map[string]interface{})
+			if ip := v.IPAddress; ip != nil {
+				// the 2018-02-01 API uses CIDR format (a.b.c.d/x), so translate that back to IP and mask
+				if strings.Contains(*ip, "/") {
+					ipAddr, ipNet, _ := net.ParseCIDR(*ip)
+					block["ip_address"] = ipAddr.String()
+					mask := net.IP(ipNet.Mask)
+					block["subnet_mask"] = mask.String()
+				} else {
+					block["ip_address"] = *ip
+				}
+			}
+			if subnet := v.SubnetMask; subnet != nil {
+				block["subnet_mask"] = *subnet
+			}
+			restrictions = append(restrictions, block)
+		}
+	}
+	result["ip_restriction"] = restrictions
 
 	results = append(results, result)
 	return results
